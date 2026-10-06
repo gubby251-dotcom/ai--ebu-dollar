@@ -1380,6 +1380,7 @@ const LIVE_QUOTE_API_URL="https://biquote.io/api/XAUUSD?allowStale=false";
 const BROKER_SCANNER_SYMBOL="XAUUSD";
 const BIQUOTE_WS_URL="https://biquote.io/hubs/tick";
 const SCANNER_TIMEFRAME_MINUTES=30;
+const SETUP4_TIMEFRAME_MINUTES=15;
 const SCANNER_BAR_LIMIT=80;
 const LIVE_MAX_AGE_MS=15000;
 const LIVE_POLL_MS=2000;
@@ -1553,6 +1554,7 @@ let lastSignalKey=null;
 let scannerBusy=false;
 let scannerStateLoaded=false;
 let scannerLastScannedCandleTime=0;
+let setup4M15LastScannedCandleTime=0;
 
 /*
   HISTORY CLEAR BOUNDARY
@@ -1586,10 +1588,16 @@ function loadScannerState(){
   scannerStateLoaded=true;
   try{ scannerLastScannedCandleTime=Number(localStorage.getItem("engulfingLastScannedCandleTime_v7_biquote"))||0; }
   catch(e){ scannerLastScannedCandleTime=0; }
+  try{ setup4M15LastScannedCandleTime=Number(localStorage.getItem("setup4M15LastScannedCandleTime_v1"))||0; }
+  catch(e){ setup4M15LastScannedCandleTime=0; }
 }
 function saveScannerState(t){
   scannerLastScannedCandleTime=Number(t)||0;
   try{ localStorage.setItem("engulfingLastScannedCandleTime_v7_biquote",String(scannerLastScannedCandleTime)); }catch(e){}
+}
+function saveSetup4M15State(t){
+  setup4M15LastScannedCandleTime=Number(t)||0;
+  try{ localStorage.setItem("setup4M15LastScannedCandleTime_v1",String(setup4M15LastScannedCandleTime)); }catch(e){}
 }
 
 /* AUDIO */
@@ -2248,6 +2256,15 @@ async function getBiQuoteCandles(){
   return candles;
 }
 
+/* SETUP 4 HAS ITS OWN M15 FEED. M30 FEED/LOGIC REMAINS SEPARATE. */
+async function getBiQuoteM15Candles(){
+  const url=CANDLE_API_URL+"?interval=15m&limit="+SCANNER_BAR_LIMIT;
+  const raw=await fetchJsonWithRetry(url,1);
+  const candles=normalizeBiQuoteBars(raw);
+  if(!candles.length) throw new Error("Invalid BiQuote XAUUSD M15 OHLC response");
+  return candles;
+}
+
 /* ONLY CLOSED M30 CANDLES */
 function getClosedCandles(candles){
   if(!Array.isArray(candles)||candles.length<3) return [];
@@ -2260,6 +2277,18 @@ function getClosedCandles(candles){
        the last bar flagged as open even after its OHLC period has ended.
        The M30 timestamp + 30-minute duration is the authoritative close
        gate. This prevents a valid C2 from being discarded after close. */
+    return (t+tfMs)<=now;
+  }).sort((a,b)=>Number(a.time)-Number(b.time));
+}
+
+/* ONLY CLOSED M15 CANDLES FOR SETUP 4 */
+function getClosedM15Candles(candles){
+  if(!Array.isArray(candles)||candles.length<4) return [];
+  const tfMs=SETUP4_TIMEFRAME_MINUTES*60*1000;
+  const now=Date.now();
+  return candles.filter(c=>{
+    const t=Number(c.time);
+    if(!Number.isFinite(t)) return false;
     return (t+tfMs)<=now;
   }).sort((a,b)=>Number(a.time)-Number(b.time));
 }
@@ -2301,16 +2330,30 @@ Number(c.close)
 
 function isBullishEngulfing(c1,c2){
   const open1=Number(c1.open), close1=Number(c1.close);
+  const high1=Number(c1.high);
   const open2=Number(c2.open), close2=Number(c2.close);
   const body1=Math.abs(close1-open1), body2=Math.abs(close2-open2);
-  return isBearish(c1)&&isBullish(c2)&&body2>body1&&open2<=close1&&close2>=open1;
+
+  // BUY: C2 wajib sudah close dan body C2 harus menembus
+  // wick high C1 dengan CLOSE C2 >= HIGH C1.
+  return isBearish(c1)&&isBullish(c2)&&
+    body2>body1&&
+    open2<=close1&&
+    close2>high1;
 }
 
 function isBearishEngulfing(c1,c2){
   const open1=Number(c1.open), close1=Number(c1.close);
+  const low1=Number(c1.low);
   const open2=Number(c2.open), close2=Number(c2.close);
   const body1=Math.abs(close1-open1), body2=Math.abs(close2-open2);
-  return isBullish(c1)&&isBearish(c2)&&body2>body1&&open2>=close1&&close2<=open1;
+
+  // SELL: C2 wajib sudah close dan body C2 harus menembus
+  // wick low C1 dengan CLOSE C2 <= LOW C1.
+  return isBullish(c1)&&isBearish(c2)&&
+    body2>body1&&
+    open2>=close1&&
+    close2<low1;
 }
 
 /* THREE MARKET-STRUCTURE SETUPS */
@@ -2417,6 +2460,86 @@ function setup3(c,dir){
     : isBearishEngulfing(c1,c2);
 }
 
+
+/*
+  SETUP 4 — M15 REVERSAL CONFIRMATION
+  Separate M15 engine. It does NOT alter Setup 1/2/3 or their M30 SL/TP.
+
+  BUY:
+    >=2 consecutive bearish candles immediately before C1
+    -> C1 bullish -> C2 bullish
+    -> C2 CLOSE > C1 WICK HIGH
+    -> Entry = 50% C2 body
+    -> SL = lowest LOW wick of C1 and candle immediately before C1
+    -> TP = 1:1
+
+  SELL:
+    >=2 consecutive bullish candles immediately before C1
+    -> C1 bearish -> C2 bearish
+    -> C2 CLOSE < C1 WICK LOW
+    -> Entry = 50% C2 body
+    -> SL = highest HIGH wick of C1 and candle immediately before C1
+    -> TP = 1:1
+*/
+function evaluateSetup4M15(candles){
+  const c=Array.isArray(candles)
+    ? candles.filter(x=>x&&[x.time,x.open,x.high,x.low,x.close].every(v=>Number.isFinite(Number(v))))
+      .sort((a,b)=>Number(a.time)-Number(b.time))
+    : [];
+
+  if(c.length<4) return null;
+
+  const c2=c[c.length-1];
+  const c1=c[c.length-2];
+  const beforeC1=c[c.length-3];
+  const beforeBeforeC1=c[c.length-4];
+
+  const tfMs=SETUP4_TIMEFRAME_MINUTES*60*1000;
+  if(Number(c2.time)+tfMs>Date.now()) return null;
+
+  const twoBeforeBullish=isBullish(beforeC1)&&isBullish(beforeBeforeC1);
+  const twoBeforeBearish=isBearish(beforeC1)&&isBearish(beforeBeforeC1);
+
+  const buy=
+    twoBeforeBearish&&
+    isBullish(c1)&&
+    isBullish(c2)&&
+    Number(c2.close)>Number(c1.high);
+
+  const sell=
+    twoBeforeBullish&&
+    isBearish(c1)&&
+    isBearish(c2)&&
+    Number(c2.close)<Number(c1.low);
+
+  if(!buy&&!sell) return null;
+
+  const type=buy?'BUY':'SELL';
+  const bodyLow=Math.min(Number(c2.open),Number(c2.close));
+  const bodyHigh=Math.max(Number(c2.open),Number(c2.close));
+  const entry=bodyLow+(bodyHigh-bodyLow)/2;
+
+  const sl=type==='BUY'
+    ? Math.min(Number(c1.low),Number(beforeC1.low))
+    : Math.max(Number(c1.high),Number(beforeC1.high));
+
+  const risk=Math.abs(entry-sl);
+  if(!(risk>0)||!Number.isFinite(entry)||!Number.isFinite(sl)) return null;
+
+  const tp=type==='BUY'?entry+risk:entry-risk;
+
+  return {
+    type,entry,sl,tp,pips:risk,
+    candleTime:Number(c2.time),
+    confirmedAt:Date.now(),
+    setupNumber:4,
+    setupName:'M15 REVERSAL CONFIRMATION',
+    timeframeMinutes:SETUP4_TIMEFRAME_MINUTES,
+    trendText:'SETUP 4 — M15 CONFIRMATION',
+    engulfText:'M15 CONFIRMED'
+  };
+}
+
 function detectMarketSetup(c,dir){
   if(setup3(c,dir)) return {number:3,name:'CONTINUATION'};
   if(setup1(c,dir)) return {number:1,name:'REVERSAL BERURUTAN'};
@@ -2456,6 +2579,7 @@ function evaluateFourRules(candles){
 
   return {type,entry,sl,tp,pips:risk,candleTime:Number(c2.time),confirmedAt:Date.now(),
     setupNumber:setup.number,setupName:setup.name,
+    timeframeMinutes:SCANNER_TIMEFRAME_MINUTES,
     trendText:`SETUP ${setup.number} — ${setup.name}`,
     engulfText:"CONFIRMED"};
 }
@@ -2588,6 +2712,12 @@ $("rule_trend").textContent=res.trendText;
 
 $("rule_trend").style.color="var(--green)";
 
+/* Setup 4 M15 valid confirmation is shown explicitly in Checkpoint 01.
+   M30 Setup 1/2/3 checkpoint behavior remains unchanged. */
+if(Number(res?.setupNumber)===4 && Number(res?.timeframeMinutes)===SETUP4_TIMEFRAME_MINUTES){
+  $("rule_trend").textContent="KONFIRMASI VALID M15";
+}
+
 $("rule_engulf").textContent=res.engulfText;
 
 $("rule_engulf").style.color="var(--green)";
@@ -2698,7 +2828,7 @@ signalHistory.unshift({
 time:
 new Date(
 Number(res.candleTime) +
-SCANNER_TIMEFRAME_MINUTES*60*1000
+(Number(res.timeframeMinutes)||SCANNER_TIMEFRAME_MINUTES)*60*1000
 )
 .toLocaleTimeString(
 "id-ID",
@@ -2720,7 +2850,9 @@ status:"PENDING",
 entryTouched:false,
 pips:res.pips,
 
-candleTime:res.candleTime
+candleTime:res.candleTime,
+timeframeMinutes:Number(res.timeframeMinutes)||SCANNER_TIMEFRAME_MINUTES,
+setupNumber:Number(res.setupNumber)||0
 
 });
 
@@ -2846,10 +2978,10 @@ function processPendingSignalsFromCandles(candles,livePrice){
   const pendingList=signalHistory.filter(s=>s && s.status==="PENDING");
   if(!pendingList.length) return false;
 
-  const tfMs=SCANNER_TIMEFRAME_MINUTES*60*1000;
   let changed=false;
 
   for(const s of pendingList){
+    const signalTfMs=(Number(s.timeframeMinutes)||SCANNER_TIMEFRAME_MINUTES)*60*1000;
     const entry=Number(s.entry);
     const sl=Number(s.sl);
     const tp=Number(s.tp);
@@ -2858,7 +2990,7 @@ function processPendingSignalsFromCandles(candles,livePrice){
 
     /* Only bars AFTER the confirmed C2 close are allowed to affect status. */
     const afterSignal=candles
-      .filter(c=>Number(c.time)>=signalTime+tfMs)
+      .filter(c=>Number(c.time)>=signalTime+signalTfMs)
       .sort((a,b)=>Number(a.time)-Number(b.time));
 
     for(const c of afterSignal){
@@ -3028,6 +3160,64 @@ async function checkPendingSignals(candleData=null){
 }
 
 
+
+/* SETUP 4 M15 SCANNER — independent from the M30 scanner */
+function scanAllSetup4M15(closedM15,maxLookback=200){
+  if(!Array.isArray(closedM15)||closedM15.length<4) return [];
+  const from=Math.max(3,closedM15.length-maxLookback);
+  const found=[];
+  for(let i=from;i<closedM15.length;i++){
+    const result=evaluateSetup4M15(closedM15.slice(0,i+1));
+    if(!result) continue;
+    const key=result.type+'_'+result.candleTime+'_SETUP4_M15';
+    if(!found.some(x=>x.type+'_'+x.candleTime+'_SETUP4_M15'===key)) found.push(result);
+  }
+  return found;
+}
+
+async function scanSetup4M15(){
+  let candles=[];
+  try{
+    candles=await getBiQuoteM15Candles();
+  }catch(e){
+    console.warn("BiQuote XAUUSD M15 REST gagal:",e);
+    return;
+  }
+
+  const closedM15=getClosedM15Candles(candles);
+  if(closedM15.length<4) return;
+
+  const newestTime=Number(closedM15[closedM15.length-1].time)||0;
+  const previousTime=Number(setup4M15LastScannedCandleTime)||0;
+
+  if(previousTime===0){
+    const first=evaluateSetup4M15(closedM15);
+    if(first){
+      const exists=signalHistory.some(s=>
+        s&&s.type===first.type&&Number(s.candleTime)===Number(first.candleTime)&&
+        Number(s.setupNumber)===4
+      );
+      if(!exists) triggerValidSignal(first);
+    }
+    saveSetup4M15State(newestTime);
+    return;
+  }
+
+  if(newestTime>previousTime){
+    const discovered=scanAllSetup4M15(closedM15,200)
+      .filter(candidate=>Number(candidate.candleTime)>previousTime);
+
+    for(const candidate of discovered){
+      const exists=signalHistory.some(s=>
+        s&&s.type===candidate.type&&Number(s.candleTime)===Number(candidate.candleTime)&&
+        Number(s.setupNumber)===4
+      );
+      if(!exists) triggerValidSignal(candidate);
+    }
+    saveSetup4M15State(newestTime);
+  }
+}
+
 /* AUTONOMOUS MARKET SCANNER */
 async function autonomousMarketScanner(){
   if(scannerBusy) return;
@@ -3036,6 +3226,11 @@ async function autonomousMarketScanner(){
     loadScannerState();
     startBiQuoteLiveHeartbeat();
     startBiQuoteWebSocket();
+
+    /* Setup 4 is M15 and is scanned independently.
+       M30 Setup 1/2/3 logic below remains untouched. */
+    await scanSetup4M15();
+
     let candles=[];
     try{ candles=await getBiQuoteCandles(); }
     catch(e){
